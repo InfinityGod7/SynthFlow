@@ -40,7 +40,7 @@ CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".synthflow.ini")
 DEFAULT_CONFIG = {
     "provider": "openai",           # "openai" or "google"
     "api_key": "",
-    "hotkey": "ctrl+shift",
+    "hotkey": "ctrl+windows",
     "model": "whisper-1",
     "cleanup": "true",
     "cleanup_model": "gpt-4o-mini",
@@ -392,6 +392,7 @@ class SynthFlowApp:
                 return
 
             self.is_recording = True
+            self._log_entry(f"Recording started (provider={provider})")
             self.show_overlay("🎙  Recording…", "#E74C3C")
             if self.tray_icon:
                 try:
@@ -406,6 +407,10 @@ class SynthFlowApp:
             self.is_recording = False
             try:
                 audio_path = self.recorder.stop()
+                frame_count = len(self.recorder.frames)
+                self._log_entry(
+                    f"Recording stopped ({frame_count} frames @ {self.recorder.sample_rate} Hz)"
+                )
             except Exception as e:
                 self._log_entry(f"Recorder stop error: {e}")
                 audio_path = None
@@ -455,7 +460,7 @@ class SynthFlowApp:
             pyperclip.copy(text)
 
             # Wait up to 2s for the user to fully release the hotkey.
-            hotkey = self.config.get("hotkey", "ctrl+shift")
+            hotkey = self.config.get("hotkey", "ctrl+windows")
             hotkey_parts = [k.strip() for k in hotkey.split("+") if k.strip()]
             deadline = time.time() + 2.0
             while time.time() < deadline:
@@ -469,8 +474,10 @@ class SynthFlowApp:
 
             # Force-release common modifiers in case the OS still thinks
             # they're down — this is the single most common cause of
-            # Ctrl+V being interpreted as Ctrl+Shift+V or failing outright.
-            for mod in ("ctrl", "shift", "alt", "win"):
+            # Ctrl+V being mis-interpreted or failing outright. Includes
+            # both "win" and "windows" aliases used by the keyboard library.
+            for mod in ("ctrl", "shift", "alt", "win", "windows",
+                        "left windows", "right windows"):
                 try:
                     keyboard.release(mod)
                 except Exception:
@@ -534,7 +541,7 @@ class SynthFlowApp:
         self._hotkey_handles.clear()
         self._hotkey_registered = False
 
-        hotkey = self.config.get("hotkey", "ctrl+shift")
+        hotkey = self.config.get("hotkey", "ctrl+windows")
 
         def on_press():
             if not self._hotkey_held:
@@ -548,9 +555,27 @@ class SynthFlowApp:
                 if self.root:
                     self.root.after(0, self.stop_recording)
 
+        # suppress=True prevents Windows from ever seeing the combo.
+        # Critical for hotkeys containing the Win key — otherwise releasing
+        # Win alone opens the Start menu and steals focus right before paste.
+        def _register(suppress: bool):
+            h1 = keyboard.add_hotkey(hotkey, on_press,
+                                     trigger_on_release=False, suppress=suppress)
+            h2 = keyboard.add_hotkey(hotkey, on_release,
+                                     trigger_on_release=True, suppress=suppress)
+            return h1, h2
+
         try:
-            h1 = keyboard.add_hotkey(hotkey, on_press, trigger_on_release=False)
-            h2 = keyboard.add_hotkey(hotkey, on_release, trigger_on_release=True)
+            try:
+                h1, h2 = _register(suppress=True)
+                self._log_entry(f"Hotkey registered (suppressed): {hotkey}")
+            except Exception:
+                # Some systems reject suppress=True; fall back to unsuppressed.
+                h1, h2 = _register(suppress=False)
+                self._log_entry(
+                    f"Hotkey registered (unsuppressed): {hotkey} — "
+                    f"Start menu may flash on Win-key release"
+                )
             self._hotkey_handles.extend([h1, h2])
             self._hotkey_registered = True
         except Exception as e:
@@ -618,7 +643,7 @@ class SynthFlowApp:
 
         # ── Hotkey ──────────────────────────────────────────────────────────
         ttk.Label(frame, text="Hold hotkey to record").grid(row=row, column=0, sticky="w", **pad)
-        self._hotkey_var = tk.StringVar(value=self.config.get("hotkey", "ctrl+shift"))
+        self._hotkey_var = tk.StringVar(value=self.config.get("hotkey", "ctrl+windows"))
         ttk.Entry(frame, textvariable=self._hotkey_var, width=20).grid(
             row=row, column=1, sticky="w", **pad); row += 1
 
