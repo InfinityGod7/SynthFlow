@@ -1,0 +1,40 @@
+name: Build SynthFlow.exe
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install openai sounddevice soundfile numpy pyperclip keyboard pystray pillow pynput pyinstaller
+
+      - name: Build executable
+        run: pyinstaller synthflow.spec --clean --noconfirm
+
+      - name: Zip artifact
+        run: Compress-Archive -Path dist\SynthFlow.exe -DestinationPath SynthFlow-windows.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SynthFlow-windows
+          path: SynthFlow-windows.zip
+          retention-days: 30
+
+      - name: Attach zip to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SynthFlow-windows.zip
