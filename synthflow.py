@@ -169,7 +169,15 @@ class AudioRecorder:
         fd, tmp_name = tempfile.mkstemp(suffix=".wav")
         os.close(fd)  # Free the lock immediately so other APIs can read it
 
-        sf.write(tmp_name, audio, self.sample_rate)
+        try:
+            sf.write(tmp_name, audio, self.sample_rate)
+        except Exception:
+            # If writing fails, don't leak the temp file.
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         return tmp_name
 
 
@@ -270,6 +278,9 @@ class SynthFlowApp:
         self.tray_icon = None
         self._hotkey_held = False
         self._hotkey_registered = False
+        self._hotkey_handles: list = []   # keyboard.add_hotkey return values
+        self._state_lock = threading.Lock()
+        self._shutting_down = False
         self.root = None
         self._overlay = None
 
@@ -293,18 +304,27 @@ class SynthFlowApp:
     # ── Logging ─────────────────────────────────────────────────────────────
 
     def _log_entry(self, message: str):
-        """Append a timestamped entry to the in-memory log and update the widget."""
+        """Append a timestamped entry to the in-memory log and update the widget.
+
+        Tk widget mutations are marshaled onto the Tk main thread via
+        `root.after(0, ...)` — Tkinter is not thread-safe.
+        """
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         entry = f"[{ts}] {message}"
         self._log.append(entry)
         if len(self._log) > 200:          # keep last 200 entries
             self._log = self._log[-200:]
-        if self._log_widget:
+        if self._log_widget and self.root:
+            def _update():
+                try:
+                    self._log_widget.configure(state="normal")
+                    self._log_widget.insert("end", entry + "\n")
+                    self._log_widget.see("end")
+                    self._log_widget.configure(state="disabled")
+                except Exception:
+                    pass
             try:
-                self._log_widget.configure(state="normal")
-                self._log_widget.insert("end", entry + "\n")
-                self._log_widget.see("end")
-                self._log_widget.configure(state="disabled")
+                self.root.after(0, _update)
             except Exception:
                 pass
 
@@ -350,32 +370,45 @@ class SynthFlowApp:
     # ── Recording flow ───────────────────────────────────────────────────────
 
     def start_recording(self):
-        if self.is_recording:
-            return
-        provider = self.config.get("provider", "openai")
-        if provider == "google":
-            ready = bool(self.config.get("gemini_api_key", "").strip())
-        else:
-            ready = bool(self.get_client())
-        if not ready:
-            self.show_overlay("⚠ Set your API key first", "#E67E22")
-            self.root.after(2000, self.hide_overlay)
-            return
+        with self._state_lock:
+            if self.is_recording or self._shutting_down:
+                return
+            provider = self.config.get("provider", "openai")
+            if provider == "google":
+                ready = bool(self.config.get("gemini_api_key", "").strip())
+            else:
+                ready = bool(self.get_client())
+            if not ready:
+                self.show_overlay("⚠ Set your API key first", "#E67E22")
+                self.root.after(2000, self.hide_overlay)
+                return
 
-        self.is_recording = True
-        self.recorder.start()
-        self.show_overlay("🎙  Recording…", "#E74C3C")
-        if self.tray_icon:
             try:
-                self.tray_icon.icon = make_recording_icon()
-            except Exception:
-                pass
+                self.recorder.start()
+            except Exception as e:
+                self._log_entry(f"Mic error: {e}")
+                self.show_overlay(f"❌ Mic error: {str(e)[:40]}", "#C0392B")
+                self.root.after(3000, self.hide_overlay)
+                return
+
+            self.is_recording = True
+            self.show_overlay("🎙  Recording…", "#E74C3C")
+            if self.tray_icon:
+                try:
+                    self.tray_icon.icon = make_recording_icon()
+                except Exception:
+                    pass
 
     def stop_recording(self):
-        if not self.is_recording:
-            return
-        self.is_recording = False
-        audio_path = self.recorder.stop()
+        with self._state_lock:
+            if not self.is_recording:
+                return
+            self.is_recording = False
+            try:
+                audio_path = self.recorder.stop()
+            except Exception as e:
+                self._log_entry(f"Recorder stop error: {e}")
+                audio_path = None
 
         if self.tray_icon:
             try:
@@ -421,26 +454,63 @@ class SynthFlowApp:
             # ── Paste ────────────────────────────────────────────────────
             pyperclip.copy(text)
 
-            # Wait for the user to have fully released the hotkey so our
-            # Ctrl+V isn't swallowed or mis-interpreted by the OS.
-            deadline = time.time() + 1.0
+            # Wait up to 2s for the user to fully release the hotkey.
             hotkey = self.config.get("hotkey", "ctrl+shift")
+            hotkey_parts = [k.strip() for k in hotkey.split("+") if k.strip()]
+            deadline = time.time() + 2.0
             while time.time() < deadline:
-                if not any(keyboard.is_pressed(k) for k in hotkey.split("+")):
+                try:
+                    still_held = any(keyboard.is_pressed(k) for k in hotkey_parts)
+                except Exception:
+                    still_held = False
+                if not still_held:
                     break
                 time.sleep(0.05)
-            time.sleep(0.2)   # small grace period after keys are up
 
-            keyboard.send("ctrl+v")
+            # Force-release common modifiers in case the OS still thinks
+            # they're down — this is the single most common cause of
+            # Ctrl+V being interpreted as Ctrl+Shift+V or failing outright.
+            for mod in ("ctrl", "shift", "alt", "win"):
+                try:
+                    keyboard.release(mod)
+                except Exception:
+                    pass
+
+            time.sleep(0.15)   # grace period for OS to register key-up
+
+            try:
+                keyboard.send("ctrl+v")
+            except Exception as e:
+                self._log_entry(f"Paste failed, clipboard still has text: {e}")
+                self.root.after(0, lambda: self.show_overlay(
+                    "📋 Copied (paste failed — use Ctrl+V)", "#E67E22"))
+                self.root.after(3000, self.hide_overlay)
+                return
 
             self.root.after(0, lambda: self.show_overlay("✅ Pasted!", "#27AE60"))
             self.root.after(1500, self.hide_overlay)
             self._log_entry("Pasted OK.")
 
+        except ImportError as e:
+            self._log_entry(f"Missing dependency: {e}")
+            self.root.after(0, lambda: self.show_overlay(
+                "❌ Gemini library not installed", "#C0392B"))
+            self.root.after(3000, self.hide_overlay)
         except Exception as e:
             err_msg = str(e)
+            # Map common API errors to friendlier messages
+            low = err_msg.lower()
+            if "rate" in low and "limit" in low:
+                short = "Rate limit — wait a moment"
+            elif "api key" in low or "unauthorized" in low or "authentication" in low:
+                short = "Invalid API key — check Settings"
+            elif "connection" in low or "network" in low or "timeout" in low:
+                short = "Network error — check connection"
+            elif "quota" in low or "insufficient" in low:
+                short = "API quota exceeded"
+            else:
+                short = err_msg[:60]
             self._log_entry(f"ERROR: {err_msg}")
-            short = err_msg[:60]
             self.root.after(0, lambda: self.show_overlay(f"❌ {short}", "#C0392B"))
             self.root.after(3000, self.hide_overlay)
 
@@ -455,25 +525,33 @@ class SynthFlowApp:
     # ── Hotkey registration ──────────────────────────────────────────────────
 
     def register_hotkey(self):
-        if self._hotkey_registered:
-            keyboard.unhook_all()
-            self._hotkey_registered = False
+        # Remove only our own hooks, not every hook in the process.
+        for h in self._hotkey_handles:
+            try:
+                keyboard.remove_hotkey(h)
+            except (KeyError, ValueError):
+                pass
+        self._hotkey_handles.clear()
+        self._hotkey_registered = False
 
         hotkey = self.config.get("hotkey", "ctrl+shift")
 
         def on_press():
             if not self._hotkey_held:
                 self._hotkey_held = True
-                self.root.after(0, self.start_recording)
+                if self.root:
+                    self.root.after(0, self.start_recording)
 
         def on_release():
             if self._hotkey_held:
                 self._hotkey_held = False
-                self.root.after(0, self.stop_recording)
+                if self.root:
+                    self.root.after(0, self.stop_recording)
 
         try:
-            keyboard.add_hotkey(hotkey, on_press, trigger_on_release=False)
-            keyboard.add_hotkey(hotkey, on_release, trigger_on_release=True)
+            h1 = keyboard.add_hotkey(hotkey, on_press, trigger_on_release=False)
+            h2 = keyboard.add_hotkey(hotkey, on_release, trigger_on_release=True)
+            self._hotkey_handles.extend([h1, h2])
             self._hotkey_registered = True
         except Exception as e:
             messagebox.showerror("Hotkey Error", str(e))
@@ -704,12 +782,52 @@ class SynthFlowApp:
         )
         self.tray_icon.run()
 
-    def quit_app(self):
-        keyboard.unhook_all()
+    def quit_app(self, *_):
+        # Idempotent: clicking Quit twice should not crash.
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        # Stop an in-progress recording so the audio stream releases the mic.
+        try:
+            if self.is_recording:
+                self.is_recording = False
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Remove our hotkeys; don't nuke hooks owned by other libraries.
+        for h in self._hotkey_handles:
+            try:
+                keyboard.remove_hotkey(h)
+            except (KeyError, ValueError):
+                pass
+        self._hotkey_handles.clear()
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+
         if self.tray_icon:
-            self.tray_icon.stop()
+            try:
+                self.tray_icon.visible = False
+                self.tray_icon.stop()
+            except Exception:
+                pass
+
         if self.root:
-            self.root.quit()
+            try:
+                self.root.quit()
+                self.root.destroy()
+            except Exception:
+                pass
+
+        # Force-exit so any non-daemon library threads (pystray, keyboard)
+        # don't keep a phantom process alive.
+        os._exit(0)
 
     # ── Run ──────────────────────────────────────────────────────────────────
 
