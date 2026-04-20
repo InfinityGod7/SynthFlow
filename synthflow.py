@@ -127,15 +127,20 @@ def device_index_from_name(name: str):
 # ── Audio Recording ───────────────────────────────────────────────────────────
 
 class AudioRecorder:
-    def __init__(self, sample_rate=16000, device=None):
-        self.sample_rate = sample_rate
+    def __init__(self, device=None):
         self.device = device      # None = system default
         self.recording = False
         self.frames = []
+        self.sample_rate = 16000  # Will be updated dynamically
 
     def start(self):
         self.frames = []
         self.recording = True
+
+        # Dynamically fetch the mic's native sample rate to avoid crashes
+        device_info = sd.query_devices(self.device, 'input')
+        self.sample_rate = int(device_info['default_samplerate'])
+
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
@@ -154,12 +159,18 @@ class AudioRecorder:
         if hasattr(self, "_stream"):
             self._stream.stop()
             self._stream.close()
+
         if not self.frames:
             return None
+
         audio = np.concatenate(self.frames, axis=0)
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        sf.write(tmp.name, audio, self.sample_rate)
-        return tmp.name
+
+        # Safely create a temp file without locking it on Windows
+        fd, tmp_name = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)  # Free the lock immediately so other APIs can read it
+
+        sf.write(tmp_name, audio, self.sample_rate)
+        return tmp_name
 
 
 # ── Transcription + Cleanup ───────────────────────────────────────────────────
@@ -252,10 +263,7 @@ class SynthFlowApp:
     def __init__(self):
         self.config = dict(load_config())
         device_idx = device_index_from_name(self.config.get("audio_device", ""))
-        self.recorder = AudioRecorder(
-            int(self.config.get("sample_rate", 16000)),
-            device=device_idx,
-        )
+        self.recorder = AudioRecorder(device=device_idx)
         self.client = None
         self.is_recording = False
         self.status_queue = queue.Queue()
