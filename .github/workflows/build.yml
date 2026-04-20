@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install openai sounddevice soundfile numpy pyperclip keyboard pystray pillow pynput pyinstaller
+        run: pip install openai sounddevice soundfile numpy pyperclip keyboard pystray pillow pynput pyinstaller google-generativeai
 
       - name: Build executable
         run: pyinstaller synthflow.spec --clean --noconfirm

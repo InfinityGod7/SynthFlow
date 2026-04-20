@@ -38,6 +38,7 @@ STARTUP_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".synthflow.ini")
 
 DEFAULT_CONFIG = {
+    "provider": "openai",           # "openai" or "google"
     "api_key": "",
     "hotkey": "ctrl+shift",
     "model": "whisper-1",
@@ -45,8 +46,10 @@ DEFAULT_CONFIG = {
     "cleanup_model": "gpt-4o-mini",
     "sample_rate": "16000",
     "language": "en",
-    "audio_device": "",      # empty = system default
+    "audio_device": "",             # empty = system default
     "run_at_startup": "false",
+    "gemini_api_key": "",
+    "gemini_model": "gemini-2.0-flash",
 }
 
 def load_config():
@@ -194,6 +197,35 @@ def cleanup_text(text: str, client: OpenAI, config: dict) -> str:
     return resp.choices[0].message.content.strip()
 
 
+# ── Gemini Transcription + Cleanup ───────────────────────────────────────────
+
+def transcribe_gemini(audio_path: str, api_key: str, config: dict) -> str:
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(config.get("gemini_model", "gemini-2.0-flash"))
+    audio_file = genai.upload_file(path=audio_path, mime_type="audio/wav")
+    try:
+        response = model.generate_content([
+            audio_file,
+            "Transcribe this audio exactly as spoken. Return only the transcription text, nothing else.",
+        ])
+        return response.text.strip()
+    finally:
+        genai.delete_file(audio_file.name)
+
+def cleanup_text_gemini(text: str, api_key: str, config: dict) -> str:
+    if not text.strip():
+        return text
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(
+        config.get("gemini_model", "gemini-2.0-flash"),
+        system_instruction=CLEANUP_SYSTEM,
+    )
+    response = model.generate_content(text)
+    return response.text.strip()
+
+
 # ── System Tray Icon ──────────────────────────────────────────────────────────
 
 def make_tray_icon(color="#4A90D9"):
@@ -312,8 +344,12 @@ class SynthFlowApp:
     def start_recording(self):
         if self.is_recording:
             return
-        client = self.get_client()
-        if not client:
+        provider = self.config.get("provider", "openai")
+        if provider == "google":
+            ready = bool(self.config.get("gemini_api_key", "").strip())
+        else:
+            ready = bool(self.get_client())
+        if not ready:
             self.show_overlay("⚠ Set your API key first", "#E67E22")
             self.root.after(2000, self.hide_overlay)
             return
@@ -348,10 +384,14 @@ class SynthFlowApp:
 
     def _process_audio(self, audio_path):
         try:
-            client = self.get_client()
+            provider = self.config.get("provider", "openai")
 
             # ── Transcribe ───────────────────────────────────────────────
-            text = transcribe(audio_path, client, self.config)
+            if provider == "google":
+                gemini_key = self.config.get("gemini_api_key", "").strip()
+                text = transcribe_gemini(audio_path, gemini_key, self.config)
+            else:
+                text = transcribe(audio_path, self.get_client(), self.config)
             self._log_entry(f"Transcribed: {text[:120]}{'…' if len(text) > 120 else ''}")
 
             if not text.strip():
@@ -364,7 +404,10 @@ class SynthFlowApp:
             do_cleanup = self.config.get("cleanup", "true").lower() == "true"
             if do_cleanup:
                 self.root.after(0, lambda: self.show_overlay("✨ Polishing…", "#9B59B6"))
-                text = cleanup_text(text, client, self.config)
+                if provider == "google":
+                    text = cleanup_text_gemini(text, gemini_key, self.config)
+                else:
+                    text = cleanup_text(text, self.get_client(), self.config)
                 self._log_entry(f"Cleaned:     {text[:120]}{'…' if len(text) > 120 else ''}")
 
             # ── Paste ────────────────────────────────────────────────────
@@ -468,10 +511,23 @@ class SynthFlowApp:
 
         row = 0
 
-        # ── API Key ─────────────────────────────────────────────────────────
+        # ── Provider ────────────────────────────────────────────────────────
+        ttk.Label(frame, text="AI Provider").grid(row=row, column=0, sticky="w", **pad)
+        self._provider_var = tk.StringVar(value=self.config.get("provider", "openai"))
+        provider_cb = ttk.Combobox(frame, textvariable=self._provider_var,
+                                   values=["openai", "google"], width=14, state="readonly")
+        provider_cb.grid(row=row, column=1, sticky="w", **pad); row += 1
+
+        # ── OpenAI API Key ──────────────────────────────────────────────────
         ttk.Label(frame, text="OpenAI API Key").grid(row=row, column=0, sticky="w", **pad)
         self._api_var = tk.StringVar(value=self.config.get("api_key", ""))
         ttk.Entry(frame, textvariable=self._api_var, width=32, show="•").grid(
+            row=row, column=1, sticky="ew", **pad); row += 1
+
+        # ── Gemini API Key ──────────────────────────────────────────────────
+        ttk.Label(frame, text="Gemini API Key").grid(row=row, column=0, sticky="w", **pad)
+        self._gemini_key_var = tk.StringVar(value=self.config.get("gemini_api_key", ""))
+        ttk.Entry(frame, textvariable=self._gemini_key_var, width=32, show="•").grid(
             row=row, column=1, sticky="ew", **pad); row += 1
 
         # ── Hotkey ──────────────────────────────────────────────────────────
@@ -517,6 +573,13 @@ class SynthFlowApp:
         ttk.Entry(frame, textvariable=self._wmodel_var, width=16).grid(
             row=row, column=1, sticky="w", **pad); row += 1
 
+        # ── Gemini model ────────────────────────────────────────────────────
+        ttk.Label(frame, text="Gemini model").grid(row=row, column=0, sticky="w", **pad)
+        self._gmodel_var = tk.StringVar(value=self.config.get("gemini_model", "gemini-2.0-flash"))
+        ttk.Combobox(frame, textvariable=self._gmodel_var, width=22,
+                     values=["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]).grid(
+            row=row, column=1, sticky="w", **pad); row += 1
+
         # ── Run at startup ──────────────────────────────────────────────────
         ttk.Label(frame, text="Run at Windows startup").grid(row=row, column=0, sticky="w", **pad)
         startup_actual = is_run_at_startup()
@@ -537,12 +600,15 @@ class SynthFlowApp:
         # ── Save button ─────────────────────────────────────────────────────
         def save():
             # Persist all settings
+            self.config["provider"]      = self._provider_var.get().strip()
             self.config["api_key"]       = self._api_var.get().strip()
+            self.config["gemini_api_key"]= self._gemini_key_var.get().strip()
             self.config["hotkey"]        = self._hotkey_var.get().strip()
             self.config["language"]      = self._lang_var.get().strip()
             self.config["cleanup"]       = "true" if self._cleanup_var.get() else "false"
             self.config["cleanup_model"] = self._cmodel_var.get().strip()
             self.config["model"]         = self._wmodel_var.get().strip()
+            self.config["gemini_model"]  = self._gmodel_var.get().strip()
             self.config["run_at_startup"]= "true" if self._startup_var.get() else "false"
 
             chosen_device = self._device_var.get()

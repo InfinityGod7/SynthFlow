@@ -14,7 +14,7 @@ if errorlevel 1 (
 
 REM Install dependencies
 echo [1/3] Installing dependencies...
-pip install openai sounddevice soundfile numpy pyperclip keyboard pystray pillow pynput pyinstaller --quiet
+pip install openai sounddevice soundfile numpy pyperclip keyboard pystray pillow pynput pyinstaller google-generativeai --quiet
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies
     pause
