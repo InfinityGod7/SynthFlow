@@ -1,5 +1,5 @@
-; SynthFlow PyInstaller spec file
-; Run: pyinstaller synthflow.spec
+# SynthFlow PyInstaller spec file
+# Run: pyinstaller synthflow.spec
 
 block_cipher = None
 
