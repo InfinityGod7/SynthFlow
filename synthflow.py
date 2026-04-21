@@ -280,6 +280,7 @@ class SynthFlowApp:
         self._hotkey_registered = False
         self._hotkey_handles: list = []   # keyboard hook/hotkey handles
         self._hotkey_contains_win = False
+        self._processing_audio = False    # blocks re-triggers during API calls
         self._state_lock = threading.Lock()
         self._shutting_down = False
         self.root = None
@@ -374,6 +375,11 @@ class SynthFlowApp:
         with self._state_lock:
             if self.is_recording or self._shutting_down:
                 return
+            if self._processing_audio:
+                # Previous capture is still being transcribed/pasted.
+                # Ignore the trigger — often caused by our own synthetic
+                # ctrl+v being re-seen by the keyboard hook.
+                return
             provider = self.config.get("provider", "openai")
             if provider == "google":
                 ready = bool(self.config.get("gemini_api_key", "").strip())
@@ -427,9 +433,11 @@ class SynthFlowApp:
             return
 
         self.show_overlay("⚙  Transcribing…", "#3498DB")
+        self._processing_audio = True
         threading.Thread(target=self._process_audio, args=(audio_path,), daemon=True).start()
 
     def _process_audio(self, audio_path):
+        self._processing_audio = True
         try:
             provider = self.config.get("provider", "openai")
 
@@ -539,6 +547,7 @@ class SynthFlowApp:
                     os.unlink(audio_path)
             except OSError:
                 pass
+            self._processing_audio = False
 
     # ── Hotkey registration ──────────────────────────────────────────────────
 
