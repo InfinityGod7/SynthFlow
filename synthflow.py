@@ -278,7 +278,8 @@ class SynthFlowApp:
         self.tray_icon = None
         self._hotkey_held = False
         self._hotkey_registered = False
-        self._hotkey_handles: list = []   # keyboard.add_hotkey return values
+        self._hotkey_handles: list = []   # keyboard hook/hotkey handles
+        self._hotkey_contains_win = False
         self._state_lock = threading.Lock()
         self._shutting_down = False
         self.root = None
@@ -485,6 +486,16 @@ class SynthFlowApp:
 
             time.sleep(0.15)   # grace period for OS to register key-up
 
+            # If the hotkey included the Win key, Windows will have opened
+            # the Start menu (since we can't suppress Win reliably). Press
+            # Esc to dismiss it so the paste lands in the original app.
+            if self._hotkey_contains_win:
+                try:
+                    keyboard.send("esc")
+                    time.sleep(0.1)   # let focus return to the previous app
+                except Exception:
+                    pass
+
             try:
                 keyboard.send("ctrl+v")
             except Exception as e:
@@ -532,51 +543,65 @@ class SynthFlowApp:
     # ── Hotkey registration ──────────────────────────────────────────────────
 
     def register_hotkey(self):
-        # Remove only our own hooks, not every hook in the process.
+        # Remove our old hooks. _hotkey_handles may contain either
+        # keyboard.hook callables or add_hotkey tokens — try both.
         for h in self._hotkey_handles:
             try:
-                keyboard.remove_hotkey(h)
-            except (KeyError, ValueError):
-                pass
+                keyboard.unhook(h)
+            except (KeyError, ValueError, TypeError):
+                try:
+                    keyboard.remove_hotkey(h)
+                except (KeyError, ValueError):
+                    pass
         self._hotkey_handles.clear()
         self._hotkey_registered = False
 
         hotkey = self.config.get("hotkey", "ctrl+windows")
 
-        def on_press():
-            if not self._hotkey_held:
-                self._hotkey_held = True
-                if self.root:
-                    self.root.after(0, self.start_recording)
+        # Parse the hotkey into canonical key names.
+        def _canon(k: str) -> str:
+            k = k.strip().lower()
+            if k in ("win", "windows", "left windows", "right windows"):
+                return "windows"
+            if k in ("left ctrl", "right ctrl"):
+                return "ctrl"
+            if k in ("left shift", "right shift"):
+                return "shift"
+            if k in ("left alt", "right alt"):
+                return "alt"
+            return k
 
-        def on_release():
-            if self._hotkey_held:
-                self._hotkey_held = False
-                if self.root:
-                    self.root.after(0, self.stop_recording)
+        required = {_canon(k) for k in hotkey.split("+") if k.strip()}
+        currently_held: set = set()
+        self._hotkey_contains_win = "windows" in required
 
-        # suppress=True prevents Windows from ever seeing the combo.
-        # Critical for hotkeys containing the Win key — otherwise releasing
-        # Win alone opens the Start menu and steals focus right before paste.
-        def _register(suppress: bool):
-            h1 = keyboard.add_hotkey(hotkey, on_press,
-                                     trigger_on_release=False, suppress=suppress)
-            h2 = keyboard.add_hotkey(hotkey, on_release,
-                                     trigger_on_release=True, suppress=suppress)
-            return h1, h2
+        # Manual event hook. add_hotkey(..., suppress=True) is known to
+        # silently drop Win-key combos on many Windows 10/11 systems —
+        # the hotkey is "registered" but events never fire. Manual
+        # state-tracking via keyboard.hook is reliable for any combo.
+        def _on_event(e):
+            try:
+                name = _canon(e.name or "")
+                if e.event_type == "down":
+                    currently_held.add(name)
+                    if required.issubset(currently_held) and not self._hotkey_held:
+                        self._hotkey_held = True
+                        if self.root:
+                            self.root.after(0, self.start_recording)
+                elif e.event_type == "up":
+                    currently_held.discard(name)
+                    if self._hotkey_held and not required.issubset(currently_held):
+                        self._hotkey_held = False
+                        if self.root:
+                            self.root.after(0, self.stop_recording)
+            except Exception:
+                # Never let a hook exception take down the keyboard thread.
+                pass
 
         try:
-            try:
-                h1, h2 = _register(suppress=True)
-                self._log_entry(f"Hotkey registered (suppressed): {hotkey}")
-            except Exception:
-                # Some systems reject suppress=True; fall back to unsuppressed.
-                h1, h2 = _register(suppress=False)
-                self._log_entry(
-                    f"Hotkey registered (unsuppressed): {hotkey} — "
-                    f"Start menu may flash on Win-key release"
-                )
-            self._hotkey_handles.extend([h1, h2])
+            handle = keyboard.hook(_on_event)
+            self._hotkey_handles.append(handle)
+            self._log_entry(f"Hotkey registered: {hotkey} (keys: {sorted(required)})")
             self._hotkey_registered = True
         except Exception as e:
             messagebox.showerror("Hotkey Error", str(e))
